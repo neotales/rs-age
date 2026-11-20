@@ -49,6 +49,11 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
 
+      # `--all-targets` does not include doctests, and the README is a doctest
+      # through `#![doc = include_str!("../README.md")]`, so this is a separate step.
+      - name: Doctests
+        run: cargo test --doc --all-features
+
       - name: Documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -81,3 +86,6 @@ jobs:
 
       - name: Test on the minimum supported Rust version
         run: cargo test --all-targets --all-features
+
+      - name: Doctests on the minimum supported Rust version
+        run: cargo test --doc --all-features

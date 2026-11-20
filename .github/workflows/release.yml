@@ -31,7 +31,7 @@ env:
 
 jobs:
   # Runs on both triggers. On workflow_dispatch this job is the whole release:
-  # checks and `cargo publish --dry-run`, never a real publish.
+  # checks and `cargo publish --dry-run --locked`, never a real publish.
   check:
     name: pre-publish checks
     runs-on: ubuntu-latest
@@ -52,8 +52,13 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
 
+      # `--all-targets` does not include doctests, and the README is a doctest
+      # through `#![doc = include_str!("../README.md")]`, so this is a separate step.
+      - name: Doctests
+        run: cargo test --doc --all-features
+
       - name: Package without publishing
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
 
   version:
     name: tag matches the crate version
@@ -130,4 +135,4 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish
+        run: cargo publish --locked
