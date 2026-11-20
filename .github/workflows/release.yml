@@ -132,7 +132,29 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
+      # One exchange covers this crate: the token crates.io returns is limited to
+      # crates whose trusted publisher matches this repository, release.yml, and
+      # an empty environment. A re-run skips a version already on crates.io.
+      # Do not republish, and do not delete or move the tag.
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked
+        run: |
+          set -euo pipefail
+          version=$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              version = tomllib.load(handle)["package"]["version"]
+          if not isinstance(version, str):
+              raise SystemExit("Cargo.toml version is not a string")
+          print(version)
+          PY
+          )
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: neotales-release (https://github.com/neotales)' \
+            "https://crates.io/api/v1/crates/neotales-age/${version}" || echo 000)
+          if [ "$code" = "200" ]; then
+            echo "neotales-age ${version} is already on crates.io; not publishing again"
+            exit 0
+          fi
+          cargo publish -p neotales-age --locked
