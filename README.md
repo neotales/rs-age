@@ -15,8 +15,8 @@ cargo add neotales-age
 
 ## What you can do 🔐
 
-**Encrypt to a public key.** A recipient writes; the matching identity reads. The
-two halves are separate values, so the public half can be handed out on its own.
+**Encrypt to a public key.** A recipient writes. The matching identity reads.
+The two halves are separate values, so the public half can be handed out on its own.
 
 ```rust
 use neotales_age::{AgeFile, AgeIdentity, AgeKey, AgeRecipient};
@@ -30,8 +30,8 @@ assert_eq!(AgeFile::decrypt(&encrypted, &[identity])?, b"a message");
 # Ok::<(), neotales_age::Error>(())
 ```
 
-**Add or remove recipients without re-encrypting the payload.** Pass one slice and
-every recipient gets a stanza in the same header.
+**Encrypt to several people at once.** Pass one slice and every recipient gets a
+stanza in the same header.
 
 ```rust
 use neotales_age::{AgeFile, AgeIdentity, AgeKey, AgeRecipient};
@@ -67,7 +67,11 @@ assert_eq!(AgeFile::decrypt_armored(&armored, &[identity])?, b"copy me");
 
 **Reuse an SSH key.** `AgeRecipient::from_ssh_public_key` and
 `AgeIdentity::from_ssh_private_key` take the OpenSSH text form for Ed25519 and
-RSA keys. A passphrase recipient comes from `AgeRecipient::from_passphrase`.
+RSA keys.
+
+**Stretch a passphrase with scrypt.** `AgeRecipient::from_passphrase` and
+`AgeIdentity::from_passphrase` take the passphrase. The work factor is written
+into the header, so decryption reproduces it.
 
 ## Licence
 
