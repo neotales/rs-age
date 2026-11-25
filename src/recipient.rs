@@ -5,7 +5,7 @@
 use std::fmt;
 
 use {
-    rsa::RsaPublicKey,
+    rsa::PublicKey as RsaPublicKey,
     zeroize::{Zeroize, Zeroizing},
 };
 

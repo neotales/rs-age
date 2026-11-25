@@ -8,7 +8,7 @@ use std::{
 };
 
 use {
-    rsa::{RsaPrivateKey, traits::PublicKeyParts},
+    rsa::{PrivateKey as RsaPrivateKey, traits::PublicKeyParts},
     zeroize::{Zeroize, Zeroizing},
 };
 
@@ -356,12 +356,8 @@ impl AgeIdentity {
     pub fn from_ssh_rsa_private_key(private_key: &RsaPrivateKey) -> Result<Self> {
         ssh::validate_ssh_rsa_private_key(private_key)?;
         let wire_key = ssh::build_rsa_wire(
-            rsa::traits::PublicKeyParts::n(private_key)
-                .to_bytes_be()
-                .as_slice(),
-            rsa::traits::PublicKeyParts::e(private_key)
-                .to_bytes_be()
-                .as_slice(),
+            ssh::rsa_to_be(rsa::traits::PublicKeyParts::n(private_key).as_ref()).as_slice(),
+            ssh::rsa_to_be(rsa::traits::PublicKeyParts::e(private_key)).as_slice(),
         );
         Ok(Self::SshRsa {
             private_key: private_key.clone(),
@@ -411,12 +407,8 @@ impl AgeIdentity {
 
     fn ssh_rsa_from_parts(private_key: RsaPrivateKey) -> Self {
         let wire_key = ssh::build_rsa_wire(
-            rsa::traits::PublicKeyParts::n(&private_key)
-                .to_bytes_be()
-                .as_slice(),
-            rsa::traits::PublicKeyParts::e(&private_key)
-                .to_bytes_be()
-                .as_slice(),
+            ssh::rsa_to_be(rsa::traits::PublicKeyParts::n(&private_key).as_ref()).as_slice(),
+            ssh::rsa_to_be(rsa::traits::PublicKeyParts::e(&private_key)).as_slice(),
         );
         Self::SshRsa {
             private_key,

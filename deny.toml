@@ -25,13 +25,6 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "transitive"
-ignore = [
-  { id = "RUSTSEC-2023-0071", reason = """\
-    neotales-age uses rsa for SSH RSA recipients and key parsing, not for \
-    private-key decryption: the OAEP decryption path uses sad-rsa. This is not \
-    a mitigation. Delete this entry when rsa leaves the graph or the crate \
-    moves to a patched line.""" },
-]
 
 [licenses]
 allow = [

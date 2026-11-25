@@ -10,46 +10,13 @@ use base64::{
 use {
     ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey as EdEncodePrivateKey},
     rsa::{
-        RsaPrivateKey,
+        PrivateKey,
         pkcs8::{EncodePrivateKey as RsaEncodePrivateKey, LineEnding},
-        rand_core::{CryptoRng, Error as RngError, RngCore},
     },
     zeroize::Zeroizing,
 };
 
 use super::*;
-
-struct TestRng(u64);
-
-impl RngCore for TestRng {
-    fn next_u32(&mut self) -> u32 {
-        u32::try_from(self.next_u64()).unwrap_or(0)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.0;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.0 = value;
-        value
-    }
-
-    fn fill_bytes(&mut self, destination: &mut [u8]) {
-        for chunk in destination.chunks_mut(8) {
-            let bytes = self.next_u64().to_le_bytes();
-            let length = chunk.len();
-            chunk.copy_from_slice(&bytes[..length]);
-        }
-    }
-
-    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> std::result::Result<(), RngError> {
-        self.fill_bytes(destination);
-        Ok(())
-    }
-}
-
-impl CryptoRng for TestRng {}
 
 const GO_AGE_EXAMPLE_IDENTITY: &str =
     "AGE-SECRET-KEY-184JMZMVQH3E6U0PSL869004Y3U2NYV7R30EU99CSEDNPH02YUVFSZW44VU";
@@ -415,10 +382,11 @@ fn rejects_mixed_scrypt_recipient() {
 
 #[test]
 fn ssh_rsa_round_trips() {
-    let private = RsaPrivateKey::new(&mut TestRng(0x1234_5678_9abc_def0), 2048).expect("RSA key");
+    let mut rng = getrandom_v04::rand_core::UnwrapErr(getrandom_v04::SysRng);
+    let private = PrivateKey::new(&mut rng, 2048).expect("RSA key");
     let public_line = SshRsaKey::export_public_key(&private.to_public_key()).expect("public line");
     let recipient = AgeRecipient::from_ssh_public_key(&public_line).expect("recipient");
-    let pem = <RsaPrivateKey as RsaEncodePrivateKey>::to_pkcs8_pem(&private, LineEnding::LF)
+    let pem = <PrivateKey as RsaEncodePrivateKey>::to_pkcs8_pem(&private, LineEnding::LF)
         .expect("private PEM");
     let identity = AgeIdentity::from_ssh_private_key(&pem).expect("identity");
     let encrypted = AgeFile::encrypt(b"ssh rsa recipient", &[recipient]).expect("encrypt");

@@ -71,10 +71,5 @@ jobs:
       - name: Install cargo-audit 0.22.2
         run: cargo install cargo-audit --version 0.22.2 --locked
 
-      # `cargo audit` reads no config file. An advisory ignore lives in
-      # deny.toml with its reason and delete condition, and has to be repeated
-      # here as `--ignore RUSTSEC-XXXX-YYYY` for a crate that has one. The
-      # neotales-age rsa ignore is reasoned about in deny.toml; keep the two in
-      # step.
       - name: Check the lockfile against the advisory database
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit

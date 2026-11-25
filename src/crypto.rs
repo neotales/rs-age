@@ -9,12 +9,7 @@ use {
     },
     hkdf::Hkdf,
     hmac::{Hmac, Mac},
-    rsa::{
-        self, Oaep, RsaPrivateKey, RsaPublicKey,
-        rand_core::OsRng,
-        traits::{PrivateKeyParts, PublicKeyParts},
-    },
-    sad_rsa::{self, BoxedUint, Oaep as HardenedOaep, rand_core::UnwrapErr},
+    rsa::{Oaep, PrivateKey, PublicKey as RsaPublicKey, traits::PublicKeyParts as _},
     sha2::{Digest, Sha256},
     x25519_dalek::{PublicKey, StaticSecret},
     zeroize::Zeroizing,
@@ -158,51 +153,65 @@ pub(crate) fn public_key_fingerprint(public_key: &[u8]) -> String {
 
 /// Encrypts with RSA-OAEP-SHA-256 and the age SSH RSA label.
 pub(crate) fn rsa_oaep_encrypt(key: &RsaPublicKey, message: &[u8]) -> Result<Vec<u8>> {
-    let label =
-        std::str::from_utf8(SSH_RSA_LABEL).map_err(|_| AgeError::Crypto("RSA OAEP label"))?;
-    let padding = Oaep::new_with_label::<rsa::sha2::Sha256, _>(label);
-    key.encrypt(&mut OsRng, padding, message)
+    let padding = Oaep::<Sha256>::new_with_label(SSH_RSA_LABEL.to_vec());
+    let mut rng = getrandom_v04::rand_core::UnwrapErr(getrandom_v04::SysRng);
+    key.encrypt(&mut rng, padding, message)
         .map_err(|_| AgeError::Crypto("RSA OAEP encryption"))
 }
 
-fn boxed_uint(bytes: &[u8], bits: usize) -> Result<BoxedUint> {
-    let bits = u32::try_from(bits).map_err(|_| AgeError::AuthenticationFailed)?;
-    BoxedUint::from_be_slice(bytes, bits).map_err(|_| AgeError::AuthenticationFailed)
-}
-
-fn boxed_secret(value: &rsa::BigUint) -> Result<BoxedUint> {
-    let bytes = Zeroizing::new(value.to_bytes_be());
-    boxed_uint(bytes.as_slice(), value.bits())
-}
-
-fn hardened_rsa_private_key(key: &RsaPrivateKey) -> Result<sad_rsa::RsaPrivateKey> {
-    let n = boxed_uint(key.n().to_bytes_be().as_slice(), key.n().bits())?;
-    let e = boxed_uint(key.e().to_bytes_be().as_slice(), key.e().bits())?;
-    let d = boxed_secret(key.d())?;
-    let primes = key
-        .primes()
-        .iter()
-        .map(boxed_secret)
-        .collect::<Result<Vec<_>>>()?;
-    sad_rsa::RsaPrivateKey::from_components(n, e, d, primes)
-        .map_err(|_| AgeError::AuthenticationFailed)
-}
-
 /// Decrypts with RSA-OAEP-SHA-256 and the age SSH RSA label.
-///
-/// The age-facing key type remains the existing `rsa` 0.9 type for API
-/// compatibility. Private operations are converted to the maintained,
-/// Marvin-hardened `sad-rsa` implementation and always use its blinded
-/// decrypt path; no raw or variable-time private modular exponentiation is
-/// performed here.
-pub(crate) fn rsa_oaep_decrypt(key: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn rsa_oaep_decrypt(key: &PrivateKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
     if ciphertext.len() != key.size() {
         return Err(AgeError::AuthenticationFailed);
     }
-    let private_key = hardened_rsa_private_key(key)?;
-    let padding = HardenedOaep::<Sha256>::new_with_label(SSH_RSA_LABEL.to_vec());
-    let mut rng = UnwrapErr(getrandom_v04::SysRng);
-    private_key
-        .decrypt_blinded(&mut rng, padding, ciphertext)
+    let padding = Oaep::<Sha256>::new_with_label(SSH_RSA_LABEL.to_vec());
+    let mut rng = getrandom_v04::rand_core::UnwrapErr(getrandom_v04::SysRng);
+    key.decrypt_blinded(&mut rng, padding, ciphertext)
         .map_err(|_| AgeError::AuthenticationFailed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_oaep_round_trip_rejects_wrong_labels_and_malformed_ciphertexts() {
+        let mut rng = getrandom_v04::rand_core::UnwrapErr(getrandom_v04::SysRng);
+        let private_key =
+            PrivateKey::new(&mut rng, 2048).expect("OS-backed RSA key generation should succeed");
+        let public_key = private_key.to_public_key();
+        let plaintext = b"age RSA OAEP test";
+        let ciphertext =
+            rsa_oaep_encrypt(&public_key, plaintext).expect("RSA OAEP encryption should succeed");
+
+        assert_eq!(
+            rsa_oaep_decrypt(&private_key, &ciphertext).expect("ciphertext should decrypt"),
+            plaintext
+        );
+        assert!(matches!(
+            rsa_oaep_decrypt(&private_key, &ciphertext[..ciphertext.len() - 1]),
+            Err(AgeError::AuthenticationFailed)
+        ));
+        let mut corrupted_ciphertext = ciphertext.clone();
+        let byte = corrupted_ciphertext
+            .last_mut()
+            .expect("RSA ciphertext is nonempty");
+        *byte ^= 1;
+        assert!(matches!(
+            rsa_oaep_decrypt(&private_key, &corrupted_ciphertext),
+            Err(AgeError::AuthenticationFailed)
+        ));
+
+        let wrong_label_ciphertext = public_key
+            .encrypt(
+                &mut rng,
+                Oaep::<Sha256>::new_with_label(b"wrong age RSA label".to_vec()),
+                plaintext,
+            )
+            .expect("test ciphertext should encrypt");
+        assert!(matches!(
+            rsa_oaep_decrypt(&private_key, &wrong_label_ciphertext),
+            Err(AgeError::AuthenticationFailed)
+        ));
+    }
 }

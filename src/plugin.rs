@@ -134,7 +134,7 @@ pub fn parse_identity(encoding: &str) -> Result<(String, Vec<u8>)> {
 #[derive(Clone)]
 pub struct PluginRecipient {
     name: String,
-    encoding: String,
+    encoding: Zeroizing<String>,
     identity: bool,
     ui: ClientUi,
     labels: Arc<Mutex<Vec<String>>>,
@@ -145,7 +145,7 @@ impl std::fmt::Debug for PluginRecipient {
         formatter
             .debug_struct("PluginRecipient")
             .field("name", &self.name)
-            .field("encoding", &self.encoding)
+            .field("encoding", &"[REDACTED]")
             .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
@@ -161,7 +161,7 @@ impl PluginRecipient {
         let (name, _) = parse_recipient(encoding.as_ref())?;
         Ok(Self {
             name,
-            encoding: encoding.as_ref().to_owned(),
+            encoding: Zeroizing::new(encoding.as_ref().to_owned()),
             identity: false,
             ui,
             labels: Arc::new(Mutex::new(Vec::new())),
@@ -278,7 +278,7 @@ impl Recipient for PluginRecipient {
 #[derive(Clone)]
 pub struct PluginIdentity {
     name: String,
-    encoding: String,
+    encoding: Zeroizing<String>,
     ui: ClientUi,
 }
 
@@ -287,7 +287,7 @@ impl std::fmt::Debug for PluginIdentity {
         formatter
             .debug_struct("PluginIdentity")
             .field("name", &self.name)
-            .field("encoding", &self.encoding)
+            .field("encoding", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -302,7 +302,7 @@ impl PluginIdentity {
         let (name, _) = parse_identity(encoding.as_ref())?;
         Ok(Self {
             name,
-            encoding: encoding.as_ref().to_owned(),
+            encoding: Zeroizing::new(encoding.as_ref().to_owned()),
             ui,
         })
     }
@@ -795,22 +795,39 @@ struct ProtocolConnection {
 }
 
 struct ClientConnection {
-    child: Child,
+    _child: ChildGuard,
     input: BufReader<ChildStdout>,
     output: ChildStdin,
 }
 
+/// Owns a plugin process and terminates/reaps it on every exit path.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> Option<&mut Child> {
+        self.0.as_mut()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
 impl ClientConnection {
     fn close(self) {
-        let Self {
-            mut child,
-            input,
-            output,
-        } = self;
-        drop(output);
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(self);
     }
 }
 
@@ -818,7 +835,7 @@ fn open_client_connection(name: &str, protocol: &str) -> Result<ClientConnection
     if !valid_plugin_name(name) || name.contains(std::path::MAIN_SEPARATOR) {
         return Err(AgeError::InvalidKey("invalid plugin name"));
     }
-    let mut child = Command::new(format!("age-plugin-{name}"))
+    let child = Command::new(format!("age-plugin-{name}"))
         .arg(format!("--age-plugin={protocol}"))
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
@@ -832,16 +849,17 @@ fn open_client_connection(name: &str, protocol: &str) -> Result<ClientConnection
                 AgeError::Io(error)
             }
         })?;
+    let mut child = ChildGuard::new(child);
     let output = child
-        .stdin
-        .take()
+        .child_mut()
+        .and_then(|child| child.stdin.take())
         .ok_or_else(|| plugin_protocol_error("plugin stdin unavailable"))?;
     let input = child
-        .stdout
-        .take()
+        .child_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| plugin_protocol_error("plugin stdout unavailable"))?;
     Ok(ClientConnection {
-        child,
+        _child: child,
         input: BufReader::new(input),
         output,
     })
@@ -966,13 +984,21 @@ fn read_stanza(input: &mut (impl BufRead + ?Sized)) -> Result<Stanza> {
             .strip_suffix('\n')
             .ok_or_else(|| plugin_protocol_error("unterminated plugin body"))?;
         let body_line = body_line.strip_suffix('\r').unwrap_or(body_line);
-        if body_line.len() > 64 || body_line.is_empty() {
+        if body_line.len() > 64 {
+            return Err(plugin_protocol_error(
+                "plugin body line exceeds 64 characters",
+            ));
+        }
+        if body_line.is_empty() {
             break;
         }
         if !body_line.bytes().all(|value| (33..=126).contains(&value)) {
             return Err(plugin_protocol_error("invalid plugin body"));
         }
         encoded.push_str(body_line);
+        if body_line.len() < 64 {
+            break;
+        }
     }
     let body = decode_raw(&encoded)?;
     Ok(Stanza::new(
@@ -1044,8 +1070,8 @@ fn plugin_protocol_error(_message: &'static str) -> AgeError {
     AgeError::InvalidFormat("invalid age plugin protocol")
 }
 
-fn plugin_response_error(body: &[u8]) -> AgeError {
-    AgeError::Io(io::Error::other(String::from_utf8_lossy(body).into_owned()))
+fn plugin_response_error(_body: &[u8]) -> AgeError {
+    plugin_protocol_error("plugin reported failure")
 }
 
 #[cfg(test)]
@@ -1121,7 +1147,7 @@ mod tests {
             }));
         let recipient = encode_recipient("test", &[]).expect("recipient encoding");
         let input = format!(
-            "-> add-recipient {recipient}\n\n-> wrap-file-key\n{}\n\n-> extension-labels\n\n-> done\n\n-> ok\n\n-> ok\n\n",
+            "-> add-recipient {recipient}\n\n-> wrap-file-key\n{}\n-> extension-labels\n\n-> done\n\n-> ok\n\n-> ok\n\n",
             crate::codec::encode_raw(&[0u8; 16])
         );
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -1150,7 +1176,7 @@ mod tests {
             }));
         let identity = encode_identity("test", &[]).expect("identity encoding");
         let input = format!(
-            "-> add-identity {identity}\n\n-> recipient-stanza 0 test\n{}\n\n-> done\n\n-> ok\n\n",
+            "-> add-identity {identity}\n\n-> recipient-stanza 0 test\n{}\n-> done\n\n-> ok\n\n",
             crate::codec::encode_raw(&[0u8; 16])
         );
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -1173,5 +1199,53 @@ mod tests {
     fn plugin_encodings_reject_wrong_prefixes() {
         assert!(parse_recipient("age1not-a-valid-name!").is_err());
         assert!(parse_identity("AGE-SECRET-KEY-1abc").is_err());
+    }
+
+    #[test]
+    fn body_short_line_ends_body_without_separator_and_preserves_next_stanza() {
+        let mut input = io::Cursor::new(b"-> value\nc2hvcnQ\n-> next\n\n".to_vec());
+        let body = super::read_stanza(&mut input).expect("short final body line");
+        assert_eq!(body.body, b"short");
+        assert_eq!(
+            super::read_stanza(&mut input)
+                .expect("following stanza")
+                .r#type,
+            "next"
+        );
+    }
+
+    #[test]
+    fn standalone_short_body_ends_at_end_of_input() {
+        let mut input = io::Cursor::new(b"-> value\nc2hvcnQ\n".to_vec());
+        assert_eq!(
+            super::read_stanza(&mut input)
+                .expect("short final body line")
+                .body,
+            b"short"
+        );
+    }
+
+    #[test]
+    fn body_lines_longer_than_64_characters_are_rejected() {
+        let input = format!("-> value\n{}\n\n", "A".repeat(65));
+        assert!(super::read_stanza(&mut io::Cursor::new(input.into_bytes())).is_err());
+    }
+
+    #[test]
+    fn short_body_line_cannot_be_followed_by_more_body_data() {
+        let input = b"-> value\nc2hvcnQ\nAAAA\n\n".to_vec();
+        let mut input = io::Cursor::new(input);
+        assert_eq!(
+            super::read_stanza(&mut input).expect("first stanza").body,
+            b"short"
+        );
+        assert!(super::read_stanza(&mut input).is_err());
+    }
+
+    #[test]
+    fn plugin_failure_text_is_not_reflected_into_errors() {
+        let error = super::plugin_response_error(b"secret-canary");
+        assert!(!error.to_string().contains("secret-canary"));
+        assert!(error.to_string().contains("invalid age plugin protocol"));
     }
 }

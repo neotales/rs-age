@@ -32,9 +32,9 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use neotales_age::{
     AgeIdentity, AgeKey, AgeRecipient, ClientUi, Confirm, DisplayMessage, Error, Identity,
-    IdentityFactory, Plugin, PluginContext, Recipient, RecipientFactory, RequestValue, Result,
-    Stanza, WaitTimer, bech32, decrypt, encode_identity, encode_recipient, encrypt_with_recipients,
-    parse_plugin_identity, parse_plugin_recipient,
+    IdentityFactory, Plugin, PluginContext, PluginIdentity, PluginRecipient, Recipient,
+    RecipientFactory, RequestValue, Result, Stanza, WaitTimer, bech32, decrypt, encode_identity,
+    encode_recipient, encrypt_with_recipients, parse_plugin_identity, parse_plugin_recipient,
 };
 // `Recipient::wrap` returns `Result<Vec<Stanza>>`, and the crate exports both,
 // so the recipient below needs no other name. `Identity` asks for
@@ -87,6 +87,27 @@ fn client_callback_types_are_nameable() {
     // `ClientUi` is `Default`, so a caller that wants only some of the four
     // does not have to name the ones it is leaving unset.
     assert!(ClientUi::default().display_message.is_none());
+}
+
+#[test]
+fn plugin_identity_and_identity_recipient_debug_redact_encoded_payloads() {
+    let encoding = encode_identity("test", b"debug-canary").expect("valid encoding");
+    let identity = PluginIdentity::new(&encoding, ClientUi::default()).expect("plugin identity");
+    let recipient = identity.recipient();
+    let recipient_encoding = encode_recipient("test", b"debug-canary").expect("valid recipient");
+    let direct_recipient =
+        PluginRecipient::new(&recipient_encoding, ClientUi::default()).expect("plugin recipient");
+
+    for debug in [
+        format!("{identity:?}"),
+        format!("{recipient:?}"),
+        format!("{direct_recipient:?}"),
+    ] {
+        assert!(!debug.contains(&encoding));
+        assert!(!debug.contains(&recipient_encoding));
+        assert!(!debug.contains("debug-canary"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }
 
 /// A recipient implemented here, by the caller, out of the crate.
@@ -267,7 +288,7 @@ fn plugin_recipient_factory_wraps_a_real_file_key() {
     // Add the recipient, offer it a 16-byte file key to wrap, then acknowledge
     // the stanza the plugin writes back.
     let input = format!(
-        "-> add-recipient {encoding}\n\n-> wrap-file-key\n{}\n\n-> done\n\n-> ok\n\n",
+        "-> add-recipient {encoding}\n\n-> wrap-file-key\n{}\n-> done\n\n-> ok\n\n",
         STANDARD_NO_PAD.encode([0x5au8; 16])
     );
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -343,7 +364,7 @@ fn plugin_identity_factory_unwraps_a_real_file_key() {
     let file_key = [0x5au8; 16];
     let stanza = recipient.wrap(&file_key).expect("wrap");
     let input = format!(
-        "-> add-identity {encoding}\n\n-> recipient-stanza 0 {kind} {share}\n{body}\n\n-> done\n\n-> ok\n\n",
+        "-> add-identity {encoding}\n\n-> recipient-stanza 0 {kind} {share}\n{body}\n-> done\n\n-> ok\n\n",
         kind = stanza.r#type,
         share = stanza.args[0],
         body = STANDARD_NO_PAD.encode(&stanza.body),

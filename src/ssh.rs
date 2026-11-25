@@ -3,14 +3,15 @@
 use base64::{self, Engine as _};
 use des::cipher::InnerIvInit as DesInnerIvInit;
 use neotales_x509::openssh_bcrypt;
+use p256::elliptic_curve::bigint::{ByteOrder, Encoding};
 use {
     aes::cipher::{BlockModeDecrypt, KeyInit, KeyIvInit, StreamCipher},
     ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as EdDecodePrivateKey},
     md5::Md5,
     rsa::{
-        self, RsaPrivateKey, RsaPublicKey,
-        pkcs1::DecodeRsaPrivateKey,
-        pkcs8::DecodePrivateKey,
+        self, BoxedUint, PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
+        pkcs1::der::{Decode as _, asn1::AsUintRef as _},
+        pkcs8::PrivateKeyInfoRef,
         traits::{PrivateKeyParts, PublicKeyParts},
     },
     sha2::Digest,
@@ -144,8 +145,8 @@ impl SshRsaKey {
     pub fn export_public_key(key: &RsaPublicKey) -> Result<String> {
         validate_ssh_rsa_key(key)?;
         let wire = build_rsa_wire(
-            key.n().to_bytes_be().as_slice(),
-            key.e().to_bytes_be().as_slice(),
+            rsa_to_be(key.n().as_ref()).as_slice(),
+            rsa_to_be(key.e()).as_slice(),
         );
         let encoded = base64::engine::general_purpose::STANDARD.encode(wire);
         Ok(format!("ssh-rsa {encoded}"))
@@ -172,8 +173,8 @@ impl SshRsaKey {
         let key = rsa_public_from_components(&modulus, &exponent)?;
         validate_ssh_rsa_key(&key)?;
         let canonical_wire = build_rsa_wire(
-            key.n().to_bytes_be().as_slice(),
-            key.e().to_bytes_be().as_slice(),
+            rsa_to_be(key.n().as_ref()).as_slice(),
+            rsa_to_be(key.e()).as_slice(),
         );
         if canonical_wire != wire {
             return Err(AgeError::InvalidKey("non-canonical SSH RSA public key"));
@@ -452,23 +453,25 @@ fn parse_openssh_rsa(reader: &mut SshReader<'_>, public_blob: &[u8]) -> Result<O
         &exponent,
         Some((prime_one.as_slice(), prime_two.as_slice())),
     )?;
-    // The private-component constructor is not limited to rsa 0.9's public
-    // 4096-bit default; the SSH bounds above are checked before it performs
+    // The private-component constructor uses the explicit SSH limits above,
+    // rather than the dependency's default public-key maximum, before it performs
     // CRT precomputation.
-    let private_key = RsaPrivateKey::from_components(
-        rsa::BigUint::from_bytes_be(&modulus),
-        rsa::BigUint::from_bytes_be(&exponent),
-        rsa::BigUint::from_bytes_be(private_exponent.as_slice()),
+    // Imported SSH keys select modulus-width prime storage unconditionally:
+    // this preserves unbalanced factors without inspecting their secret widths.
+    let private_key = RsaPrivateKey::from_components_with_wide_primes(
+        rsa_uint_from_be(&modulus)?,
+        rsa_uint_from_be(&exponent)?,
+        rsa_uint_from_be(private_exponent.as_slice())?,
         vec![
-            rsa::BigUint::from_bytes_be(prime_one.as_slice()),
-            rsa::BigUint::from_bytes_be(prime_two.as_slice()),
+            rsa_uint_from_be(prime_one.as_slice())?,
+            rsa_uint_from_be(prime_two.as_slice())?,
         ],
     )
     .map_err(|_| AgeError::InvalidKey("invalid OpenSSH RSA private key"))?;
     validate_ssh_rsa_private_key(&private_key)?;
     let expected_wire = build_rsa_wire(
-        private_key.n().to_bytes_be().as_slice(),
-        private_key.e().to_bytes_be().as_slice(),
+        rsa_to_be(private_key.n().as_ref()).as_slice(),
+        rsa_to_be(private_key.e()).as_slice(),
     );
     if expected_wire != public_blob {
         return Err(AgeError::InvalidKey(
@@ -713,13 +716,13 @@ fn parse_legacy_encrypted_rsa(text: &str, passphrase: &[u8]) -> Result<OpenSshPr
                 continue;
             }
         };
-        let Ok(private_key) = RsaPrivateKey::from_pkcs1_der(plaintext.as_slice()) else {
+        let Ok(private_key) = rsa_private_key_from_pkcs1_der(plaintext.as_slice()) else {
             continue;
         };
         validate_ssh_rsa_private_key(&private_key)?;
         let wire_key = build_rsa_wire(
-            private_key.n().to_bytes_be().as_slice(),
-            private_key.e().to_bytes_be().as_slice(),
+            rsa_to_be(private_key.n().as_ref()).as_slice(),
+            rsa_to_be(private_key.e()).as_slice(),
         );
         return Ok(OpenSshPrivateKey::Rsa {
             private_key,
@@ -856,14 +859,48 @@ pub(crate) fn parse_ed25519_pkcs8_pem(pem: &str) -> Result<OpenSshPrivateKey> {
 
 /// Parses a PEM RSA private key (PKCS#1 or PKCS#8).
 pub(crate) fn parse_rsa_pem(pem: &str) -> Result<RsaPrivateKey> {
-    if let Ok(key) = RsaPrivateKey::from_pkcs1_pem(pem) {
-        validate_ssh_rsa_private_key(&key)?;
-        return Ok(key);
-    }
-    let key = RsaPrivateKey::from_pkcs8_pem(pem)
+    let (label, der) = rsa::pkcs1::der::SecretDocument::from_pem(pem)
         .map_err(|_| AgeError::InvalidKey("invalid RSA private key"))?;
+    let key = match label {
+        "RSA PRIVATE KEY" => rsa_private_key_from_pkcs1_der(der.as_bytes())?,
+        "PRIVATE KEY" => rsa_private_key_from_pkcs8_der(der.as_bytes())?,
+        _ => return Err(AgeError::InvalidKey("invalid RSA private key")),
+    };
     validate_ssh_rsa_private_key(&key)?;
     Ok(key)
+}
+
+fn rsa_private_key_from_pkcs1_der(der: &[u8]) -> Result<RsaPrivateKey> {
+    let components = rsa::pkcs1::RsaPrivateKeyRef::from_der(der)
+        .map_err(|_| AgeError::InvalidKey("invalid RSA private key"))?;
+    if components.version() != rsa::pkcs1::Version::TwoPrime {
+        return Err(AgeError::InvalidKey("invalid RSA private key"));
+    }
+    RsaPrivateKey::from_components_with_wide_primes(
+        rsa_uint_from_be(components.modulus.as_uint_ref().as_bytes())?,
+        rsa_uint_from_be(components.public_exponent.as_uint_ref().as_bytes())?,
+        rsa_uint_from_be(components.private_exponent.as_uint_ref().as_bytes())?,
+        vec![
+            rsa_uint_from_be(components.prime1.as_uint_ref().as_bytes())?,
+            rsa_uint_from_be(components.prime2.as_uint_ref().as_bytes())?,
+        ],
+    )
+    .map_err(|_| AgeError::InvalidKey("invalid RSA private key"))
+}
+
+fn rsa_private_key_from_pkcs8_der(der: &[u8]) -> Result<RsaPrivateKey> {
+    let info = PrivateKeyInfoRef::try_from(der)
+        .map_err(|_| AgeError::InvalidKey("invalid RSA private key"))?;
+    if info.algorithm.oid.as_bytes() != [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]
+        || info
+            .algorithm
+            .parameters_any()
+            .map_err(|_| AgeError::InvalidKey("invalid RSA private key"))?
+            != rsa::pkcs8::der::asn1::Null.into()
+    {
+        return Err(AgeError::InvalidKey("invalid RSA private key"));
+    }
+    rsa_private_key_from_pkcs1_der(info.private_key.as_bytes())
 }
 
 fn passphrase_missing_error(public_blob: &[u8]) -> Result<AgeError> {
@@ -994,10 +1031,10 @@ fn skip_line_break(text: &str, index: usize) -> Result<usize> {
 pub(crate) fn validate_ssh_rsa_private_key(key: &RsaPrivateKey) -> Result<()> {
     validate_ssh_rsa_key(&key.to_public_key())?;
     for prime in key.primes() {
-        let prime_bytes = prime.to_bytes_be();
+        let prime_bytes = rsa_to_be(prime.as_ref());
         if prime_bytes.is_empty()
             || prime_bytes.last().is_none_or(|byte| byte & 1 == 0)
-            || prime.bits() > SSH_RSA_MAX_PRIME_BITS
+            || prime.bit_width() as usize > SSH_RSA_MAX_PRIME_BITS
         {
             return Err(AgeError::InvalidKey(
                 "SSH RSA prime factors must be odd and at most 8192 bits",
@@ -1008,8 +1045,8 @@ pub(crate) fn validate_ssh_rsa_private_key(key: &RsaPrivateKey) -> Result<()> {
 }
 
 fn validate_ssh_rsa_key(key: &RsaPublicKey) -> Result<()> {
-    let modulus = key.n().to_bytes_be();
-    let exponent = key.e().to_bytes_be();
+    let modulus = rsa_to_be(key.n().as_ref());
+    let exponent = rsa_to_be(key.e());
     validate_ssh_rsa_components(&modulus, &exponent, None)
 }
 
@@ -1033,9 +1070,9 @@ fn validate_ssh_rsa_components(
     if exponent_bits > SSH_RSA_MAX_EXPONENT_BITS {
         return Err(AgeError::InvalidKey("invalid SSH RSA public exponent"));
     }
-    let exponent_value = rsa::BigUint::from_bytes_be(exponent);
-    if exponent_value.bits() > SSH_RSA_MAX_EXPONENT_BITS
-        || exponent_value < rsa::BigUint::from(3u8)
+    let exponent_value = rsa_uint_from_be(exponent)?;
+    if exponent_value.bit_width() as usize > SSH_RSA_MAX_EXPONENT_BITS
+        || exponent_value < BoxedUint::from(3u8)
         || exponent.last().is_none_or(|byte| byte & 1 == 0)
     {
         return Err(AgeError::InvalidKey("invalid SSH RSA public exponent"));
@@ -1067,15 +1104,42 @@ fn ssh_mpint_bit_len(value: &[u8]) -> usize {
 
 fn rsa_public_from_components(modulus: &[u8], exponent: &[u8]) -> Result<RsaPublicKey> {
     validate_ssh_rsa_components(modulus, exponent, None)?;
-    // rsa 0.9 defaults to a 4096-bit public-key limit. SSH's wire policy is
-    // 16384 bits, so use the checked, caller-sized constructor rather than
+    // RSA 0.10 defaults to an 8192-bit limit. SSH's wire policy is
+    // 16384 bits, so use the checked size-limits constructor rather than
     // bypassing validation with `new_unchecked`.
-    RsaPublicKey::new_with_max_size(
-        rsa::BigUint::from_bytes_be(modulus),
-        rsa::BigUint::from_bytes_be(exponent),
-        SSH_RSA_MAX_MODULUS_BITS,
+    RsaPublicKey::new_with_size_limits(
+        rsa_uint_from_be(modulus)?,
+        rsa_uint_from_be(exponent)?,
+        SSH_RSA_MIN_MODULUS_BITS..=SSH_RSA_MAX_MODULUS_BITS,
     )
     .map_err(|_| AgeError::InvalidKey("invalid RSA public key"))
+}
+
+fn rsa_uint_from_be(bytes: &[u8]) -> Result<BoxedUint> {
+    if bytes.is_empty() || bytes.len() > 2048 {
+        return Err(AgeError::InvalidKey(
+            "RSA integer exceeds the SSH RSA size policy",
+        ));
+    }
+    let precision = u32::try_from(
+        bytes
+            .len()
+            .checked_mul(8)
+            .ok_or(AgeError::AuthenticationFailed)?,
+    )
+    .map_err(|_| AgeError::AuthenticationFailed)?;
+    BoxedUint::from_be_slice(bytes, precision)
+        .map_err(|_| AgeError::InvalidKey("invalid RSA integer"))
+}
+
+pub(crate) fn rsa_to_be(value: &BoxedUint) -> Vec<u8> {
+    let bytes = value.to_bytes(ByteOrder::BigEndian);
+    let bytes = bytes.as_ref();
+    let first_nonzero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    bytes.get(first_nonzero..).unwrap_or_default().to_vec()
 }
 
 fn build_ed25519_wire(public_key: &[u8; 32]) -> Vec<u8> {
