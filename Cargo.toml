@@ -1,7 +1,7 @@
 [package]
 name = "neotales-age"
 description = "age v1 file encryption: recipients, identities, plugins, and encrypted containers"
-version = "0.0.0-alpha.1"
+version = "0.0.0-alpha.2"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
